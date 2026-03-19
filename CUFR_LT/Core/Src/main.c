@@ -69,21 +69,27 @@ UART_HandleTypeDef huart1;
 UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
-HAL_StatusTypeDef ok_notok = HAL_BUSY;
-uint8_t CMD0 [] = {0x40,0x00,0x00, 0x00, 0x00, 0x95};
-uint8_t high [] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
-uint8_t CMD1 [] = {0x41,0x00,0x00, 0x00, 0x00, 0x79};
-uint8_t CMD8 [] = {0x48, 0x00, 0x00, 0x01, 0xAA, 0x87};
-uint8_t CMD55 [] = {0x77, 0x00, 0x00, 0x00, 0x00, 0x65};
-uint8_t ACMD41 [] = {0x69, 0x40, 0x00, 0x00, 0x00, 0x77};
-uint8_t highByte [] = {0xFF};
+HAL_StatusTypeDef ok_notok = HAL_BUSY;   // Tracks HAL SPI call success/failure during SD init
 
-uint8_t CMD0_Response [2]; //8 (max wait) + 2 (payload)
-uint8_t CMD1_Response [2];
-uint8_t CMD8_Response [7];
-uint8_t CMD55_Response [2];
-uint8_t ACMD41_Response [2];
-int count = 0;
+// -------- Raw SD command frames (6 bytes each) --------
+// Format: [ command byte | 4-byte argument | CRC ]
+// These are sent directly over SPI during low-level SD-card initialization.
+
+uint8_t CMD0 [] = {0x40,0x00,0x00, 0x00, 0x00, 0x95};      // CMD0: software reset, puts SD card into idle/SPI init state
+uint8_t high [] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}; // Dummy clocks sent with MOSI held high before init
+uint8_t CMD1 [] = {0x41,0x00,0x00, 0x00, 0x00, 0x79};      // CMD1: legacy init command, kept here for testing/older-card bring-up
+uint8_t CMD8 [] = {0x48, 0x00, 0x00, 0x01, 0xAA, 0x87};    // CMD8: checks voltage range / confirms SD v2-style interface
+uint8_t CMD55 [] = {0x77, 0x00, 0x00, 0x00, 0x00, 0x65};   // CMD55: prefix indicating next command is application-specific
+uint8_t ACMD41 [] = {0x69, 0x40, 0x00, 0x00, 0x00, 0x77};  // ACMD41: application init command, used repeatedly until card exits idle
+uint8_t highByte [] = {0xFF};                              // Single dummy byte used between commands / while polling response
+
+uint8_t CMD0_Response [2];      // Stores R1-style response bytes for CMD0
+uint8_t CMD1_Response [2];      // Stores response bytes for CMD1
+uint8_t CMD8_Response [7];      // Stores CMD8 response + returned check pattern
+uint8_t CMD55_Response [2];     // Stores response bytes for CMD55
+uint8_t ACMD41_Response [2];    // Stores response bytes for ACMD41
+
+int count = 0;                  // Generic retry counter for init loops / timeout protection
 
 CAN_RxHeaderTypeDef   RxHeader;
 uint8_t               RxData[8];
@@ -118,144 +124,217 @@ void myprintf(const char *fmt, ...) {
 
 }
 
+// Send the CMD55 + ACMD41 sequence used to bring an SD card out of idle state.
+// Returns 1 on success, 0 on failure / timeout.
 int acdm55(void) {
+	// Send a couple of dummy bytes first to keep SPI clocks running
+	// and give the card time between commands.
 	ok_notok = HAL_SPI_Transmit(&hspi2, highByte, 1, 1000);
 	ok_notok = HAL_SPI_Transmit(&hspi2, highByte, 1, 1000);
-	ok_notok = HAL_SPI_Transmit(&hspi2, CMD55, 6, 1000); //Sending in Blocking mode
+
+	// Send CMD55: tells the card the next command is application-specific.
+	ok_notok = HAL_SPI_Transmit(&hspi2, CMD55, 6, 1000); // Send full 6-byte SD command frame
+	HAL_Delay(10);                                       // Small delay before reading response
+	HAL_SPI_Receive(&hspi2, CMD55_Response, 2, 1000);    // Read response bytes back from card
+
+	// Retry CMD55 until we get the expected response or hit a timeout.
+	count = 0;
+	while(count < 20 && CMD55_Response[0] != 0x0 && CMD55_Response[1] != 0x1){
+		count++;
+
+		// Print unexpected response bytes for debug visibility.
+		for(int i = 0; i<2; i++){
+			myprintf("(%x)", CMD55_Response[i]);
+		}
+		myprintf("\r\n");
+
+		// Try CMD55 again.
+		ok_notok = HAL_SPI_Transmit(&hspi2, CMD55, 6, 1000);
 		HAL_Delay(10);
 		HAL_SPI_Receive(&hspi2, CMD55_Response, 2, 1000);
-		//HAL_Delay(1000);
-		count = 0;
-		while(count < 20 && CMD55_Response[0] != 0x0 && CMD55_Response[1] != 0x1){
-				count++;
-				for(int i = 0; i<2; i++){
-							  myprintf("(%x)", CMD55_Response[i]);
-						  }
-				myprintf("\r\n");
-			  ok_notok = HAL_SPI_Transmit(&hspi2, CMD55, 6, 1000); //Sending in Blocking mode
-			  HAL_Delay(10);
-			  HAL_SPI_Receive(&hspi2, CMD55_Response, 2, 1000);
-		}
-		if(count == 20){
-			//myprintf("CMD 55 Timeout \r\n");
-				return 0;
-			}
-		myprintf("CMD55: ");
+	}
+
+	// If the card never responds correctly, stop here and report failure.
+	if(count == 20){
+		//myprintf("CMD 55 Timeout \r\n");
+		return 0;
+	}
+
+	// Print final CMD55 response once it succeeds.
+	myprintf("CMD55: ");
+	for(int i = 0; i<2; i++){
+		myprintf("(%x)", CMD55_Response[i]);
+	}
+	myprintf("\r\n");
+
+	// Send extra dummy clocks before the next command.
+	ok_notok = HAL_SPI_Transmit(&hspi2, highByte, 1, 1000);
+	ok_notok = HAL_SPI_Transmit(&hspi2, highByte, 1, 1000);
+
+	// Send ACMD41: actual SD initialization command after CMD55.
+	// This is what asks the card to leave idle state and become ready.
+	ok_notok = HAL_SPI_Transmit(&hspi2, ACMD41, 6, 1000);
+	HAL_Delay(100);                                          // Give card more time for init step
+	HAL_SPI_Receive(&hspi2, ACMD41_Response, 2, 1000);       // Read response bytes
+
+	count = 0;
+
+	// If ACMD41 does not return success, print the response and report failure.
+	if(ACMD41_Response[0] != 0x0 && ACMD41_Response[1] != 0x0)
+	{
+		myprintf("ACMD41 Fail once: ");
 		for(int i = 0; i<2; i++){
-				  myprintf("(%x)", CMD55_Response[i]);
-			  }
-		myprintf("\r\n");
-		ok_notok = HAL_SPI_Transmit(&hspi2, highByte, 1, 1000);
-		ok_notok = HAL_SPI_Transmit(&hspi2, highByte, 1, 1000);
-		//ACMD41
-		ok_notok = HAL_SPI_Transmit(&hspi2, ACMD41, 6, 1000); //Sending in Blocking mode
-		HAL_Delay(100);
-		HAL_SPI_Receive(&hspi2, ACMD41_Response, 2, 1000);
-		count = 0;
-		if(ACMD41_Response[0] != 0x0 && ACMD41_Response[1] != 0x0)
-		{
-			myprintf("ACMD41 Fail once: ");
-			for(int i = 0; i<2; i++){
-				myprintf("(%x)", ACMD41_Response[i]);
-			}
-			myprintf("\r\n");
-			return 0;
+			myprintf("(%x)", ACMD41_Response[i]);
 		}
-		myprintf("ACMD41: ");
-		for(int i = 0; i<2; i++){
-				  myprintf("(%x)", ACMD41_Response[i]);
-			  }
 		myprintf("\r\n");
-		return 1;
+		return 0;
+	}
+
+	// Print successful ACMD41 response for debug.
+	myprintf("ACMD41: ");
+	for(int i = 0; i<2; i++){
+		myprintf("(%x)", ACMD41_Response[i]);
+	}
+	myprintf("\r\n");
+
+	// Both CMD55 and ACMD41 worked, so report success.
+	return 1;
 }
 
+// ================================================================
+// MANUAL SD-CARD SPI STARTUP SEQUENCE
+// explicit chip-select control, raw SD init commands, response checking + retry loops, visible success/failure behavior on the board LED.
+// ================================================================
 void configure_sd(void) {
 
+	// Deassert chip select first so the card is not selected.
 	HAL_GPIO_WritePin(GPIOB, SD_CS_Pin, SET);
-	ok_notok = HAL_SPI_Transmit(&hspi2, high, 10, 1000); //Sending in Blocking mode
-	HAL_GPIO_WritePin(GPIOB, SD_CS_Pin, RESET);
-	//HAL_GPIO_WritePin(GPIOA, Green_LED_Pin, SET);
-	//		  ok_notok = HAL_UART_Transmit(&huart2, (uint8_t *)hw, len, 100);
 
-	//CMD0:
-	ok_notok = HAL_SPI_Transmit(&hspi2, CMD0, 6, 1000); //Sending in Blocking mode
-	HAL_Delay(100);
-	HAL_SPI_Receive(&hspi2, CMD0_Response, 2, 1000);
+	// Send 80 dummy clock cycles with MOSI held high.
+	// SD cards require startup clocks before entering SPI init mode.
+	ok_notok = HAL_SPI_Transmit(&hspi2, high, 10, 1000); // 10 bytes = 80 clocks
+
+	// Assert chip select so following commands are intended for the SD card.
+	HAL_GPIO_WritePin(GPIOB, SD_CS_Pin, RESET);
+
+	// ---------------- CMD0 ----------------
+	// CMD0 resets the card and requests entry into idle / SPI startup state.
+	ok_notok = HAL_SPI_Transmit(&hspi2, CMD0, 6, 1000); // Send 6-byte SD command frame
+	HAL_Delay(100);                                     // Give card time to respond
+	HAL_SPI_Receive(&hspi2, CMD0_Response, 2, 1000);    // Read response bytes
+
+	// Retry CMD0 until the card reports idle state (0x01) or timeout.
 	count = 0;
 	while(CMD0_Response[1] != 0x1 && count < 20){
 	  count++;
 	  myprintf("0 Failed once: \r\n");
-	  ok_notok = HAL_SPI_Transmit(&hspi2, CMD0, 6, 1000); //Sending in Blocking mode
+
+	  // Retry the reset command.
+	  ok_notok = HAL_SPI_Transmit(&hspi2, CMD0, 6, 1000);
 	  HAL_Delay(100);
 	  HAL_SPI_Receive(&hspi2, CMD0_Response, 2, 1000);
 	}
+
+	// If the card never enters idle state, abort initialization.
 	if(count == 20){
 		myprintf("Timeout \r\n");
 		return;
 	}
+
+	// Print final CMD0 response for debug visibility.
 	myprintf("CMD0: ");
 	for(int i = 0; i<2; i++){
-			  myprintf("(%x)", CMD0_Response[i]);
-		  }
+		myprintf("(%x)", CMD0_Response[i]);
+	}
 	myprintf("\r\n");
-	//HAL_Delay(100);
+
+	// Send dummy bytes between commands to keep SPI clocks running.
 	ok_notok = HAL_SPI_Transmit(&hspi2, highByte, 1, 1000);
 	ok_notok = HAL_SPI_Transmit(&hspi2, highByte, 1, 1000);
 
-	//CMD8:
-	ok_notok = HAL_SPI_Transmit(&hspi2, CMD8, 6, 1000); //Sending in Blocking mode
+	// ---------------- CMD8 ----------------
+	// CMD8 checks interface conditions:
+	// - confirms voltage support
+	// - helps distinguish newer SD cards from older behavior
+	ok_notok = HAL_SPI_Transmit(&hspi2, CMD8, 6, 1000);
 	HAL_Delay(100);
 	HAL_SPI_Receive(&hspi2, CMD8_Response, 7, 1000);
-	//HAL_Delay(1000);
+
+	// Retry until response shows idle state and echoed check pattern 0xAA.
 	count = 0;
 	while(count < 20 && (CMD8_Response[1] != 0x1 || CMD8_Response[5] != 0xAA)){
-			count++;
-			  myprintf("8 Failed once: \r\n");
-			  for(int i = 0; i<7; i++){
-			  			  myprintf("(%x)", CMD8_Response[i]);
-			  		  }
-			  ok_notok = HAL_SPI_Transmit(&hspi2, CMD8, 6, 1000); //Sending in Blocking mode
-			  HAL_Delay(100);
-			  HAL_SPI_Receive(&hspi2, CMD8_Response, 7, 1000);
+		count++;
+		myprintf("8 Failed once: \r\n");
+
+		// Print returned bytes so we can see exactly how the card responded.
+		for(int i = 0; i<7; i++){
+			myprintf("(%x)", CMD8_Response[i]);
+		}
+
+		// Retry CMD8.
+		ok_notok = HAL_SPI_Transmit(&hspi2, CMD8, 6, 1000);
+		HAL_Delay(100);
+		HAL_SPI_Receive(&hspi2, CMD8_Response, 7, 1000);
 	}
+
+	// Abort if CMD8 never gives the expected response.
 	if(count == 20){
 		myprintf("Timeout \r\n");
-			return;
-		}
+		return;
+	}
+
+	// Print final CMD8 response for debug.
 	myprintf("CMD8: ");
 	for(int i = 0; i<7; i++){
-			  myprintf("(%x)", CMD8_Response[i]);
-		  }
+		myprintf("(%x)", CMD8_Response[i]);
+	}
 	myprintf("\r\n");
+
+	// Send dummy bytes before next command group.
 	ok_notok = HAL_SPI_Transmit(&hspi2, highByte, 1, 1000);
 	ok_notok = HAL_SPI_Transmit(&hspi2, highByte, 1, 1000);
 
-	//CMD55:
+	// ---------------- CMD55 + ACMD41 ----------------
+	// CMD55 tells the card the next command is application-specific.
+	// ACMD41 is the actual init command that asks the card to leave idle state.
 	int counter = 0;
 	int worked = acdm55();
+
 	myprintf("Worked: (%i)\r\n", worked);
-	while(worked == 0 && counter<20){
-			worked = acdm55();
-			//myprintf("Worked: (%i)\r\n", worked);
-			counter++;
-			//myprintf("Count: (%x)\r\n", count);
-			if(worked==1){
-				myprintf("yay!\r\n");
-			}
+
+	// Keep retrying until the card is ready or we hit a timeout.
+	while(worked == 0 && counter < 20){
+		worked = acdm55();
+		counter++;
+
+		if(worked == 1){
+			myprintf("yay!\r\n"); // Card finally accepted init sequence
+		}
 	}
+
 	myprintf("Count: %i\r\n", counter);
 	myprintf("Worked: %i\r\n", worked);
-	if(counter==20){
+
+	// Abort if card never exits idle state.
+	if(counter == 20){
 		myprintf("Timeout\r\n");
 		return;
 	}
 
 	myprintf("End of Start Up\r\n");
+
+	// If the last HAL transaction succeeded, turn on LED as visible success signal.
 	if(ok_notok == HAL_OK){
 	  HAL_GPIO_WritePin(GPIOA, Green_LED_Pin, SET);
 	}
+
+	// Hold LED on briefly so successful init is obvious on the board.
 	HAL_Delay(1000);
+
+	// Turn LED back off after startup indication.
 	HAL_GPIO_WritePin(GPIOA, Green_LED_Pin, RESET);
+
+	// Deassert chip select when done so the SD card is no longer selected.
 	HAL_GPIO_WritePin(GPIOB, SD_CS_Pin, SET);
 }
 
