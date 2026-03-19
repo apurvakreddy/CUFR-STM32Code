@@ -5,9 +5,6 @@ import pandas as pd
 # INTERVIEW FOCUS: OFFLINE CONFIGURATION -> settings.bin
 # This script converts the human-edited CSV packet settings
 # into a compact binary file that the STM32 can read at boot.
-# Key idea:
-# - keep configuration easy to edit on the laptop side
-# - keep parsing simple and deterministic on the MCU side
 # ============================================================
 
 # Run as:
